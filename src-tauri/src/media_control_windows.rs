@@ -1,3 +1,4 @@
+use super::windows_batch::{self, MediaSession, PlaybackStatus};
 use log::debug;
 use windows::core::HRESULT;
 use windows::Media::Control::{
@@ -33,100 +34,85 @@ impl Drop for WinRtGuard {
     }
 }
 
-pub fn pause_active_session() -> Result<Option<String>, String> {
+/// Pauses playing sessions that expose a usable source app ID. Per-session
+/// failures are skipped; every successful pause is returned for later resume.
+/// Setup errors can only be returned before any pause has been attempted.
+pub fn pause_active_sessions() -> Result<Vec<String>, String> {
     let _guard = WinRtGuard::initialize()?;
     let manager = request_manager()?;
-    let Some(session) = find_playing_session(&manager)? else {
-        return Ok(None);
-    };
-
-    let Some(playback_info) = playback_info(&session)? else {
-        return Ok(None);
-    };
-    let controls = playback_info
-        .Controls()
-        .map_err(|err| format!("Failed to get Windows playback controls: {err}"))?;
-
-    if !controls
-        .IsPauseEnabled()
-        .map_err(|err| format!("Failed to query Windows pause support: {err}"))?
-    {
-        return Ok(None);
-    }
-
-    let paused = session
-        .TryPauseAsync()
-        .map_err(|err| format!("Failed to request Windows pause: {err}"))?
-        .get()
-        .map_err(|err| format!("Failed to wait for Windows pause: {err}"))?;
-
-    if !paused {
-        return Ok(None);
-    }
-
-    let Some(source_app_user_model_id) = session_source_app_user_model_id(&session)? else {
-        debug!("Skipped storing paused Windows session because its source app id disappeared");
-        return Ok(None);
-    };
-
-    Ok(Some(source_app_user_model_id))
+    let sessions = enumerate_sessions(&manager)?;
+    Ok(windows_batch::pause_sessions(&sessions))
 }
 
-pub fn resume_session(source_app_user_model_id: &str) -> Result<(), String> {
+/// Attempts to resume every tracked source app that is still paused. Errors
+/// from individual sessions are reported after the remaining sessions are tried.
+/// Already-playing, stopped, closed, and untracked sessions are left alone.
+pub fn resume_sessions(source_app_user_model_ids: &[String]) -> Result<(), String> {
+    if source_app_user_model_ids.is_empty() {
+        return Ok(());
+    }
     let _guard = WinRtGuard::initialize()?;
     let manager = request_manager()?;
-    let Some(session) = find_session_by_source_app_id(&manager, source_app_user_model_id)? else {
-        debug!(
-            "Skipping Windows media resume because session '{}' no longer exists",
-            source_app_user_model_id
-        );
-        return Ok(());
-    };
+    let sessions = enumerate_sessions(&manager)?;
+    windows_batch::resume_sessions(&sessions, source_app_user_model_ids)
+}
 
-    let Some(playback_info) = playback_info(&session)? else {
-        debug!(
-            "Skipping Windows media resume because session '{}' no longer exposes playback info",
-            source_app_user_model_id
-        );
-        return Ok(());
-    };
-    let status = playback_info
-        .PlaybackStatus()
-        .map_err(|err| format!("Failed to query Windows playback status: {err}"))?;
-
-    if status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing {
-        return Ok(());
+impl MediaSession for GlobalSystemMediaTransportControlsSession {
+    fn source_app_id(&self) -> Result<Option<String>, String> {
+        session_source_app_user_model_id(self)
     }
 
-    let controls = playback_info
-        .Controls()
-        .map_err(|err| format!("Failed to get Windows playback controls: {err}"))?;
-
-    if !controls
-        .IsPlayEnabled()
-        .map_err(|err| format!("Failed to query Windows play support: {err}"))?
-    {
-        debug!(
-            "Skipping Windows media resume because session '{}' no longer supports play",
-            source_app_user_model_id
-        );
-        return Ok(());
+    fn playback_status(&self) -> Result<Option<PlaybackStatus>, String> {
+        let Some(info) = playback_info(self)? else {
+            return Ok(None);
+        };
+        let status = info
+            .PlaybackStatus()
+            .map_err(|err| format!("Failed to query Windows playback status: {err}"))?;
+        Ok(Some(match status {
+            GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing => {
+                PlaybackStatus::Playing
+            }
+            GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused => {
+                PlaybackStatus::Paused
+            }
+            _ => PlaybackStatus::Other,
+        }))
     }
 
-    let resumed = session
-        .TryPlayAsync()
-        .map_err(|err| format!("Failed to request Windows play: {err}"))?
-        .get()
-        .map_err(|err| format!("Failed to wait for Windows play: {err}"))?;
-
-    if !resumed {
-        debug!(
-            "Windows media session '{}' declined the play request; ignoring",
-            source_app_user_model_id
-        );
+    fn pause_enabled(&self) -> Result<bool, String> {
+        let Some(info) = playback_info(self)? else {
+            return Ok(false);
+        };
+        info.Controls()
+            .map_err(|err| format!("Failed to get Windows playback controls: {err}"))?
+            .IsPauseEnabled()
+            .map_err(|err| format!("Failed to query Windows pause support: {err}"))
     }
 
-    Ok(())
+    fn play_enabled(&self) -> Result<bool, String> {
+        let Some(info) = playback_info(self)? else {
+            return Ok(false);
+        };
+        info.Controls()
+            .map_err(|err| format!("Failed to get Windows playback controls: {err}"))?
+            .IsPlayEnabled()
+            .map_err(|err| format!("Failed to query Windows play support: {err}"))
+    }
+
+    fn try_pause(&self) -> Result<bool, String> {
+        self.TryPauseAsync()
+            .map_err(|err| format!("Failed to request Windows pause: {err}"))?
+            .get()
+            .map_err(|err| format!("Failed to wait for Windows pause: {err}"))
+    }
+
+    fn try_play(&self) -> Result<bool, String> {
+        self.TryPlayAsync()
+            .map_err(|err| format!("Failed to request Windows play: {err}"))?
+            .get()
+            .map_err(|err| format!("Failed to wait for Windows play: {err}"))
+    }
 }
 
 fn request_manager() -> Result<GlobalSystemMediaTransportControlsSessionManager, String> {
@@ -136,15 +122,9 @@ fn request_manager() -> Result<GlobalSystemMediaTransportControlsSessionManager,
         .map_err(|err| format!("Failed to wait for Windows media session manager: {err}"))
 }
 
-fn find_playing_session(
+fn enumerate_sessions(
     manager: &GlobalSystemMediaTransportControlsSessionManager,
-) -> Result<Option<GlobalSystemMediaTransportControlsSession>, String> {
-    if let Some(current_session) = current_session(manager)? {
-        if session_is_playing(&current_session)? {
-            return Ok(Some(current_session));
-        }
-    }
-
+) -> Result<Vec<GlobalSystemMediaTransportControlsSession>, String> {
     let sessions = manager
         .GetSessions()
         .map_err(|err| format!("Failed to enumerate Windows media sessions: {err}"))?;
@@ -152,63 +132,15 @@ fn find_playing_session(
         .Size()
         .map_err(|err| format!("Failed to query Windows media session count: {err}"))?;
 
+    let mut collected = Vec::with_capacity(count as usize);
     for index in 0..count {
-        let session = sessions.GetAt(index).map_err(|err| {
-            format!("Failed to read Windows media session at index {index}: {err}")
-        })?;
-
-        if session_is_playing(&session)? {
-            return Ok(Some(session));
+        match sessions.GetAt(index) {
+            Ok(session) => collected.push(session),
+            Err(err) => debug!("Skipping unreadable Windows media session at index {index}: {err}"),
         }
     }
 
-    Ok(None)
-}
-
-fn find_session_by_source_app_id(
-    manager: &GlobalSystemMediaTransportControlsSessionManager,
-    source_app_user_model_id: &str,
-) -> Result<Option<GlobalSystemMediaTransportControlsSession>, String> {
-    if let Some(current_session) = current_session(manager)? {
-        if session_source_app_user_model_id(&current_session)?.as_deref()
-            == Some(source_app_user_model_id)
-        {
-            return Ok(Some(current_session));
-        }
-    }
-
-    let sessions = manager
-        .GetSessions()
-        .map_err(|err| format!("Failed to enumerate Windows media sessions: {err}"))?;
-    let count = sessions
-        .Size()
-        .map_err(|err| format!("Failed to query Windows media session count: {err}"))?;
-
-    for index in 0..count {
-        let session = sessions.GetAt(index).map_err(|err| {
-            format!("Failed to read Windows media session at index {index}: {err}")
-        })?;
-
-        if session_source_app_user_model_id(&session)?.as_deref() == Some(source_app_user_model_id)
-        {
-            return Ok(Some(session));
-        }
-    }
-
-    Ok(None)
-}
-
-fn current_session(
-    manager: &GlobalSystemMediaTransportControlsSessionManager,
-) -> Result<Option<GlobalSystemMediaTransportControlsSession>, String> {
-    match manager.GetCurrentSession() {
-        Ok(session) => Ok(Some(session)),
-        Err(err) if err.code() == HRESULT(0x80070490u32 as i32) => Ok(None),
-        Err(err) if err.code() == HRESULT(0x80004005u32 as i32) => Ok(None),
-        Err(err) => Err(format!(
-            "Failed to get current Windows media session: {err}"
-        )),
-    }
+    Ok(collected)
 }
 
 fn playback_info(
@@ -222,18 +154,6 @@ fn playback_info(
         Err(err) if session_missing_error(err.code()) => Ok(None),
         Err(err) => Err(format!("Failed to get Windows playback info: {err}")),
     }
-}
-
-fn session_is_playing(session: &GlobalSystemMediaTransportControlsSession) -> Result<bool, String> {
-    let Some(playback_info) = playback_info(session)? else {
-        return Ok(false);
-    };
-
-    let status = playback_info
-        .PlaybackStatus()
-        .map_err(|err| format!("Failed to query Windows playback status: {err}"))?;
-
-    Ok(status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing)
 }
 
 fn session_source_app_user_model_id(
